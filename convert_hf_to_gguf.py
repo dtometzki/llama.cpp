@@ -3410,10 +3410,122 @@ class QwenModel(TextModel):
 class Qwen2Model(TextModel):
     model_arch = gguf.MODEL_ARCH.QWEN2
 
-    def set_vocab(self):
+    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
+        tokens: list[str] = []
+        toktypes: list[int] = []
+
         try:
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
+            vocab_size = self.hparams.get("vocab_size", len(tokenizer.vocab))
+            assert max(tokenizer.vocab.values()) < vocab_size
+
+            tokpre = self.get_vocab_base_pre(tokenizer)
+
+            reverse_vocab = {id_: encoded_tok for encoded_tok, id_ in tokenizer.vocab.items()}
+            added_vocab = tokenizer.get_added_vocab()
+
+            added_tokens_decoder = tokenizer.added_tokens_decoder
+
+            for i in range(vocab_size):
+                if i not in reverse_vocab:
+                    tokens.append(f"[PAD{i}]")
+                    toktypes.append(gguf.TokenType.UNUSED)
+                else:
+                    token: str = reverse_vocab[i]
+                    if token in added_vocab:
+                        # The tokenizer in llama.cpp assumes the CONTROL and USER_DEFINED tokens are pre-normalized.
+                        # To avoid unexpected issues - we make sure to normalize non-normalized tokens
+                        if not added_tokens_decoder[i].normalized:
+                            previous_token = token
+                            token = tokenizer.decode(tokenizer.encode(token, add_special_tokens=False))
+                            if previous_token != token:
+                                logger.info(f"{repr(previous_token)} is encoded and decoded back to {repr(token)} using AutoTokenizer")
+
+                        if added_tokens_decoder[i].special or self.does_token_look_special(token):
+                            toktypes.append(gguf.TokenType.CONTROL)
+                        else:
+                            # NOTE: this was added for Gemma.
+                            # Encoding and decoding the tokens above isn't sufficient for this case.
+                            token = token.replace(b"\xe2\x96\x81".decode("utf-8"), " ")  # pre-normalize user-defined spaces
+                            toktypes.append(gguf.TokenType.USER_DEFINED)
+                    else:
+                        toktypes.append(gguf.TokenType.NORMAL)
+                    tokens.append(token)
+
+            return tokens, toktypes, tokpre
+
+        except (AttributeError, OSError, ImportError):
+            logger.warning("AutoTokenizer.from_pretrained failed, falling back to manual tokenizer.json loading")
+            tokenizer_json_file = self.dir_model / 'tokenizer.json'
+            if not tokenizer_json_file.is_file():
+                 raise FileNotFoundError(f"File not found: {tokenizer_json_file}")
+            
+            with open(tokenizer_json_file, "r", encoding="utf-8") as f:
+                tokenizer_json = json.load(f)
+            
+            vocab = tokenizer_json.get("model", {}).get("vocab", {})
+            if not vocab:
+                 raise ValueError("Could not find vocab in tokenizer.json")
+            
+            vocab_size = self.hparams.get("vocab_size", len(vocab))
+            reverse_vocab = {id_: token for token, id_ in vocab.items()}
+            
+            # For added tokens
+            added_tokens_decoder = {} # Map id -> info
+            added_vocab = set()
+            
+            # tokenizer.json usually has "added_tokens" list
+            added_tokens_list = tokenizer_json.get("added_tokens", [])
+            for t in added_tokens_list:
+                id_ = t["id"]
+                content = t["content"]
+                added_tokens_decoder[id_] = t
+                added_vocab.add(content)
+                if id_ not in reverse_vocab:
+                    reverse_vocab[id_] = content
+
+            # Also check tokenizer_config.json for added_tokens_decoder
+            tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
+            if tokenizer_config_file.is_file():
+                with open(tokenizer_config_file, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                    if "added_tokens_decoder" in config:
+                         for id_str, info in config["added_tokens_decoder"].items():
+                             id_ = int(id_str)
+                             added_tokens_decoder[id_] = info
+                             added_vocab.add(info["content"])
+                             if id_ not in reverse_vocab:
+                                 reverse_vocab[id_] = info["content"]
+
+            tokpre = "qwen2"
+            
+            for i in range(vocab_size):
+                if i not in reverse_vocab:
+                    tokens.append(f"[PAD{i}]")
+                    toktypes.append(gguf.TokenType.UNUSED)
+                else:
+                    token = reverse_vocab[i]
+                    if token in added_vocab:
+                         is_special = False
+                         if i in added_tokens_decoder:
+                             is_special = added_tokens_decoder[i].get("special", False)
+                         
+                         if is_special or self.does_token_look_special(token):
+                             toktypes.append(gguf.TokenType.CONTROL)
+                         else:
+                             token = token.replace(b"\xe2\x96\x81".decode("utf-8"), " ")
+                             toktypes.append(gguf.TokenType.USER_DEFINED)
+                    else:
+                        toktypes.append(gguf.TokenType.NORMAL)
+                    tokens.append(token)
+            
+            return tokens, toktypes, tokpre
+
+    def set_vocab(self):
+        if (self.dir_model / "tokenizer.model").is_file():
             self._set_vocab_sentencepiece()
-        except FileNotFoundError:
+        else:
             self._set_vocab_gpt2()
 
     def set_gguf_parameters(self):
@@ -3480,9 +3592,9 @@ class DreamModel(TextModel):
         return tokens, toktypes, tokpre
 
     def set_vocab(self):
-        try:
+        if (self.dir_model / "tokenizer.model").is_file():
             self._set_vocab_sentencepiece()
-        except FileNotFoundError:
+        else:
             self._set_vocab_gpt2()
 
     def set_gguf_parameters(self):
